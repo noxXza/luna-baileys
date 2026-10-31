@@ -1,0 +1,2152 @@
+import { Boom } from '@hapi/boom';
+import { createHash, randomBytes } from 'crypto';
+import { zip } from 'fflate';
+import { promises as fs } from 'fs';
+import { proto } from '../../WAProto/index.js';
+import { CALL_AUDIO_PREFIX, CALL_VIDEO_PREFIX, DONATE_URL, LIBRARY_NAME, MEDIA_KEYS, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults/index.js';
+import { ButtonHeaderType, ButtonType, CarouselCardType, ListType, WAMessageStatus, WAProto } from '../Types/index.js';
+import { isLidUser, isPnUser, isJidGroup, isJidNewsletter, isJidStatusBroadcast, jidNormalizedUser } from '../WABinary/index.js';
+import { sha256 } from './crypto.js';
+import { generateMessageIDV2, getKeyAuthor, unixTimestampSeconds } from './generics.js';
+import { downloadContentFromMessage, encryptedStream, extractImageThumb, generateThumbnail, getAudioDuration, getAudioWaveform, getImageProcessingLibrary, getRawMediaUploadData, getStream, toBuffer } from './messages-media.js';
+import { shouldIncludeReportingToken } from './reporting-utils.js';
+import { buildMusicMessage, normalizeStickers } from './status-stickers.js';
+import { buildSocialPreview } from './link-preview-metadata.js';
+import { buildPaymentReminder, buildSplitPayment, buildSplitPaymentUpdate } from './payment-messages.js';
+import { NATIVE_FLOW_BUTTON_LIMIT, WEB_SUPPORTED_INTERACTIVE_FLOWS, getNativeFlowNameByButtonName } from './native-flow.js';
+
+const trimEmptyValues = (object) => {
+    for (const key of Object.keys(object)) {
+        if (object[key] === undefined) {
+            delete object[key];
+        }
+    }
+    return object;
+};
+
+/**
+ * externalAdReply wants the artwork inline as jpeg bytes, and a full cover is
+ * far past what a thumbnail may weigh, so it is downscaled when an image
+ * library is around and passed through untouched when none is.
+ */
+const songThumbnail = async (artwork, width, logger) => {
+    const source = Buffer.isBuffer(artwork) ? artwork : await toBuffer(await getStream(artwork).then(({ stream }) => stream));
+    try {
+        const { buffer } = await extractImageThumb(source, width);
+        return buffer;
+    }
+    catch (error) {
+        logger?.warn?.({ trace: error?.message }, 'could not downscale the song artwork, sending it whole');
+        return source;
+    }
+};
+const CONCURRENCY_LIMIT = 15;
+const MIMETYPE_MAP = {
+    image: 'image/jpeg',
+    video: 'video/mp4',
+    document: 'application/pdf',
+    audio: 'audio/ogg; codecs=opus',
+    sticker: 'image/webp',
+    'product-catalog-image': 'image/jpeg'
+};
+const MessageTypeProto = {
+    image: WAProto.Message.ImageMessage,
+    video: WAProto.Message.VideoMessage,
+    audio: WAProto.Message.AudioMessage,
+    sticker: WAProto.Message.StickerMessage,
+    document: WAProto.Message.DocumentMessage
+};
+
+export const extractUrlFromText = (text) => text.match(URL_REGEX)?.[0];
+export const generateLinkPreviewIfRequired = async (text, getUrlInfo, logger) => {
+    const url = extractUrlFromText(text);
+    if (!!getUrlInfo && url) {
+        try {
+            const urlInfo = await getUrlInfo(url);
+            return urlInfo;
+        }
+        catch (error) {
+
+            logger?.warn({ trace: error.stack }, 'url generation failed');
+        }
+    }
+};
+export const prepareLinkThumbnail = async (image, options, { thumbnailWidth = 640, upload = true } = {}) => {
+    if (upload && typeof options?.upload !== 'function') {
+        throw new Boom('a large link thumbnail has to be uploaded, so this needs an upload function', { statusCode: 400 });
+    }
+    const source = Buffer.isBuffer(image) ? image : await toBuffer(await getStream(image).then(({ stream }) => stream));
+    let full;
+    let width;
+    let height;
+    try {
+        const probe = await extractImageThumb(source, thumbnailWidth);
+        const original = probe.original;
+        width = Math.min(thumbnailWidth, original.width);
+        height = Math.round(original.height * width / original.width);
+        full = width === thumbnailWidth ? probe.buffer : (await extractImageThumb(source, width)).buffer;
+    }
+    catch (error) {
+        options.logger?.warn?.({ trace: error?.message }, 'no image library could measure the link thumbnail, so the card stays small');
+        return { jpegThumbnail: source };
+    }
+    let jpegThumbnail;
+    try {
+        jpegThumbnail = (await extractImageThumb(source, Math.min(192, width))).buffer;
+    }
+    catch {
+        jpegThumbnail = full;
+    }
+    if (!upload) {
+        return { jpegThumbnail };
+    }
+    const blob = await encryptedStream(full, 'thumbnail-link', {
+        logger: options.logger,
+        opts: options.options
+    });
+    let result;
+    try {
+        result = await options.upload(blob.encFilePath, {
+            fileEncSha256B64: blob.fileEncSha256.toString('base64'),
+            mediaType: 'thumbnail-link',
+            timeoutMs: options.mediaUploadTimeoutMs
+        });
+    }
+    finally {
+        fs.unlink(blob.encFilePath).catch(() => options.logger?.warn?.('failed to remove tmp file'));
+    }
+    return {
+        jpegThumbnail,
+        highQualityThumbnail: {
+            directPath: result.directPath,
+            mediaKey: blob.mediaKey,
+            mediaKeyTimestamp: unixTimestampSeconds(),
+            fileSha256: blob.fileSha256,
+            fileEncSha256: blob.fileEncSha256,
+            width,
+            height
+        }
+    };
+};
+const eventSeconds = (value, name) => {
+    if (value instanceof Date) {
+        return Math.floor(value.getTime() / 1000);
+    }
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        throw new Boom(`event ${name} must be a Date or a unix timestamp`, { statusCode: 400 });
+    }
+    return Math.floor(number > 1e11 ? number / 1000 : number);
+};
+const assertColor = async (color) => {
+    if (typeof color === 'number') {
+        return color >= 0 ? color : 0xffffffff + color + 1;
+    }
+    let hex = color.trim().replace('#', '');
+    if (hex.length <= 6) {
+        hex = 'FF' + hex.padStart(6, '0');
+    }
+    return parseInt(hex, 16);
+};
+export const getPollOptionHash = (optionName, fileSha256) => {
+    const nameHash = createHash('sha256').update(String(optionName), 'utf-8').digest('hex');
+    const fileHash = fileSha256 ? Buffer.from(fileSha256).toString('base64') : '';
+    return createHash('sha256').update(nameHash + fileHash, 'utf-8').digest('hex');
+};
+export const prepareWAMessageMedia = async (message, options) => {
+    const logger = options.logger;
+    let mediaType;
+    for (const key of MEDIA_KEYS) {
+        if (key in message) {
+            mediaType = key;
+        }
+    }
+    if (!mediaType) {
+        throw new Boom('Invalid media type', { statusCode: 400 });
+    }
+    const uploadData = {
+        ...message,
+        media: message[mediaType]
+    };
+    delete uploadData[mediaType];
+
+    const annotations = uploadData.statusStickers ?? uploadData.interactiveAnnotations;
+    delete uploadData.statusStickers;
+    if (annotations) {
+        if (mediaType !== 'image' && mediaType !== 'video') {
+            throw new Boom('status stickers only ride on an image or a video', { statusCode: 400 });
+        }
+        uploadData.interactiveAnnotations = normalizeStickers(annotations);
+    }
+
+    const cacheableKey = typeof uploadData.media === 'object' &&
+        'url' in uploadData.media &&
+        !!uploadData.media.url &&
+        !!options.mediaCache &&
+        mediaType + ':' + uploadData.media.url.toString();
+    if (mediaType === 'document' && !uploadData.fileName) {
+        uploadData.fileName = 'file';
+    }
+    if (!uploadData.mimetype) {
+        uploadData.mimetype = MIMETYPE_MAP[mediaType];
+    }
+    if (cacheableKey) {
+        const mediaBuff = await options.mediaCache.get(cacheableKey);
+        if (mediaBuff) {
+            logger?.debug({ cacheableKey }, 'got media cache hit');
+            const obj = proto.Message.decode(mediaBuff);
+            const key = `${mediaType}Message`;
+            Object.assign(obj[key], { ...uploadData, media: undefined });
+            return obj;
+        }
+    }
+    const isNewsletter = !!options.jid && isJidNewsletter(options.jid);
+    if (isNewsletter) {
+        logger?.info({ key: cacheableKey }, 'Preparing raw media for newsletter');
+        const { filePath, fileSha256, fileLength } = await getRawMediaUploadData(uploadData.media, options.mediaTypeOverride || mediaType, logger);
+        const fileSha256B64 = fileSha256.toString('base64');
+        const { mediaUrl, directPath, thumbnailDirectPath, thumbnailSha256 } = await options.upload(filePath, {
+            fileEncSha256B64: fileSha256B64,
+            mediaType: mediaType,
+            timeoutMs: options.mediaUploadTimeoutMs,
+            newsletter: isNewsletter
+        });
+        await fs.unlink(filePath);
+        const obj = WAProto.Message.fromObject({
+
+            [`${mediaType}Message`]: MessageTypeProto[mediaType].fromObject({
+                url: mediaUrl,
+                directPath,
+                fileSha256,
+                fileLength,
+                thumbnailDirectPath,
+                thumbnailSha256,
+                ...uploadData,
+                media: undefined
+            })
+        });
+        if (uploadData.ptv) {
+            obj.ptvMessage = obj.videoMessage;
+            delete obj.videoMessage;
+        }
+        if (obj.stickerMessage) {
+            obj.stickerMessage.stickerSentTs = Date.now();
+        }
+        if (cacheableKey) {
+            logger?.debug({ cacheableKey }, 'set cache');
+            await options.mediaCache.set(cacheableKey, WAProto.Message.encode(obj).finish());
+        }
+        return obj;
+    }
+    const requiresDurationComputation = mediaType === 'audio' && typeof uploadData.seconds === 'undefined';
+    const requiresThumbnailComputation = (mediaType === 'image' || mediaType === 'video') && typeof uploadData['jpegThumbnail'] === 'undefined';
+    const requiresWaveformProcessing = mediaType === 'audio' && uploadData.ptt === true && typeof uploadData.waveform === 'undefined';
+    const requiresAudioBackground = options.backgroundColor != null && mediaType === 'audio' && uploadData.ptt === true;
+    const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation;
+    const { mediaKey, encFilePath, originalFilePath, fileEncSha256, fileSha256, fileLength } = await encryptedStream(uploadData.media, options.mediaTypeOverride || mediaType, {
+        logger,
+        saveOriginalFileIfRequired: requiresOriginalForSomeProcessing,
+        opts: options.options
+    });
+    const fileEncSha256B64 = fileEncSha256.toString('base64');
+    const [{ mediaUrl, directPath }] = await Promise.all([
+        (async () => {
+            const result = await options.upload(encFilePath, {
+                fileEncSha256B64,
+                mediaType,
+                timeoutMs: options.mediaUploadTimeoutMs
+            });
+            logger?.debug({ mediaType, cacheableKey }, 'uploaded media');
+            return result;
+        })(),
+        (async () => {
+            if (requiresAudioBackground) {
+                uploadData.backgroundArgb = await assertColor(options.backgroundColor);
+                logger?.debug('computed backgroundColor audio status');
+            }
+            try {
+                if (requiresThumbnailComputation) {
+                    const { thumbnail, originalImageDimensions } = await generateThumbnail(originalFilePath, mediaType, options);
+                    uploadData.jpegThumbnail = thumbnail;
+                    if (!uploadData.width && originalImageDimensions) {
+                        uploadData.width = originalImageDimensions.width;
+                        uploadData.height = originalImageDimensions.height;
+                        logger?.debug('set dimensions');
+                    }
+                    logger?.debug('generated thumbnail');
+                }
+                if (requiresDurationComputation) {
+                    uploadData.seconds = await getAudioDuration(originalFilePath);
+                    logger?.debug('computed audio duration');
+                }
+                if (requiresWaveformProcessing) {
+                    uploadData.waveform = await getAudioWaveform(originalFilePath, logger);
+                    logger?.debug('processed waveform');
+                }
+            }
+            catch (error) {
+                logger?.warn({ trace: error.stack }, 'failed to obtain extra info');
+            }
+        })()
+    ]).finally(async () => {
+        try {
+            await fs.unlink(encFilePath);
+            if (originalFilePath) {
+                await fs.unlink(originalFilePath);
+            }
+            logger?.debug('removed tmp files');
+        }
+        catch (error) {
+            logger?.warn('failed to remove tmp file');
+        }
+    });
+    const obj = WAProto.Message.fromObject({
+        [`${mediaType}Message`]: MessageTypeProto[mediaType].fromObject({
+            url: mediaUrl,
+            directPath,
+            mediaKey,
+            fileEncSha256,
+            fileSha256,
+            fileLength,
+            mediaKeyTimestamp: unixTimestampSeconds(),
+            ...uploadData,
+            media: undefined
+        })
+    });
+    if (uploadData.ptv) {
+        obj.ptvMessage = obj.videoMessage;
+        delete obj.videoMessage;
+    }
+    if (cacheableKey) {
+        logger?.debug({ cacheableKey }, 'set cache');
+        await options.mediaCache.set(cacheableKey, WAProto.Message.encode(obj).finish());
+    }
+    return obj;
+};
+
+const prepareProductMessage = async (message, options) => {
+    if (!message.businessOwnerJid) {
+        throw new Boom('"businessOwnerJid" is missing from the content', { statusCode: 400 });
+    }
+    const { imageMessage } = await prepareWAMessageMedia({ image: message.image || message.product.productImage }, options);
+
+    const { image, ...content } = message;
+    content.product = {
+        currencyCode: 'IDR',
+        priceAmount1000: 1000,
+        title: LIBRARY_NAME,
+        ...message.product,
+        productImage: imageMessage
+    };
+    return content;
+};
+
+const prepareStickerPackMessage = async (message, options) => {
+    const { cover, stickers = [], name = '📦 Sticker Pack', publisher = 'GitHub: rexxhayanasi', description = '🏷️ rexxhayanasi/elaina' } = message;
+    if (stickers.length > 60) {
+        throw new Boom('Sticker pack exceeds the maximum limit of 60 stickers', { statusCode: 400 });
+    }
+    if (stickers.length === 0) {
+        throw new Boom('Sticker pack must contain at least one sticker', { statusCode: 400 });
+    }
+    if (!cover) {
+        throw new Boom('Sticker pack must contain a cover', { statusCode: 400 });
+    }
+    const logger = options.logger;
+
+    let cacheableKey = false;
+    if (Array.isArray(stickers) && stickers.length && options.mediaCache) {
+        const urls = [];
+        for (let i = 0; i < stickers.length; i++) {
+            const data = stickers[i].data;
+            if (typeof data === 'object' && data?.url) {
+                urls.push(data.url);
+            }
+        }
+        if (urls.length > 0) {
+            cacheableKey = 'sticker:' + urls.join('@');
+        }
+    }
+    if (cacheableKey) {
+        const mediaBuff = await options.mediaCache.get(cacheableKey);
+        if (mediaBuff) {
+            logger?.debug({ cacheableKey }, 'got media cache hit');
+            return proto.Message.StickerPackMessage.decode(mediaBuff);
+        }
+    }
+    const lib = await getImageProcessingLibrary();
+    const hasSharp = 'sharp' in lib && !!lib.sharp?.default;
+    const hasImage = 'image' in lib && !!lib.image?.Transformer;
+    const hasJimp = 'jimp' in lib && !!lib.jimp?.Jimp;
+    if (!hasSharp && !hasImage) {
+        throw new Boom('No image processing library (sharp or @napi-rs/image) available for converting sticker to WebP.');
+    }
+    const stickerPackIdValue = generateMessageIDV2();
+    const stickerData = {};
+    const stickerMetadata = new Array(stickers.length);
+    for (let i = 0; i < stickers.length; i += CONCURRENCY_LIMIT) {
+        const promises = [];
+        const chunkEnd = Math.min(i + CONCURRENCY_LIMIT, stickers.length);
+        for (let j = i; j < chunkEnd; j++) {
+            promises.push((async (index) => {
+                const sticker = stickers[index];
+                const { stream } = await getStream(sticker.data);
+                const buffer = await toBuffer(stream);
+                let webpBuffer;
+                let isAnimated = false;
+                if (isWebPBuffer(buffer)) {
+                    webpBuffer = buffer;
+                    isAnimated = isAnimatedWebP(buffer);
+                }
+                else if (hasSharp) {
+                    webpBuffer = await lib.sharp.default(buffer)
+                        .resize(512, 512, { fit: 'inside' })
+                        .webp({ quality: 80 })
+                        .toBuffer();
+                }
+                else {
+                    webpBuffer = await new lib.image.Transformer(buffer)
+                        .resize(512, 512)
+                        .webp(80);
+                }
+                if (webpBuffer.length > 1024 * 1024) {
+                    throw new Boom(`Sticker at index ${index} exceeds the 1MB size limit`, { statusCode: 400 });
+                }
+                const hash = sha256(webpBuffer).toString('base64').replace(/\//g, '-');
+                const fileName = `${hash}.webp`;
+                stickerData[fileName] = [new Uint8Array(webpBuffer), { level: 0 }];
+                stickerMetadata[index] = {
+                    fileName,
+                    mimetype: 'image/webp',
+                    isAnimated,
+                    emojis: sticker.emojis || ['✨'],
+                    accessibilityLabel: sticker.accessibilityLabel || '‎'
+                };
+            })(j));
+        }
+        await Promise.all(promises);
+    }
+    const trayIconFileName = `${stickerPackIdValue}.webp`;
+    const { stream: coverStream } = await getStream(cover);
+    const coverBuffer = await toBuffer(coverStream);
+    let coverWebpBuffer;
+    if (isWebPBuffer(coverBuffer)) {
+        coverWebpBuffer = coverBuffer;
+    }
+    else if (hasSharp) {
+        coverWebpBuffer = await lib.sharp.default(coverBuffer)
+            .resize(512, 512, { fit: 'inside' })
+            .webp({ quality: 80 })
+            .toBuffer();
+    }
+    else {
+        coverWebpBuffer = await new lib.image.Transformer(coverBuffer)
+            .resize(512, 512)
+            .webp(80);
+    }
+    stickerData[trayIconFileName] = [new Uint8Array(coverWebpBuffer), { level: 0 }];
+    const zipBuffer = await new Promise((resolve, reject) => {
+        zip(stickerData, (error, data) => error ? reject(error) : resolve(Buffer.from(data)));
+    });
+    const stickerPackUpload = await encryptedStream(zipBuffer, 'sticker-pack', {
+        logger,
+        opts: options.options
+    });
+    let stickerPackUploadResult;
+    try {
+        stickerPackUploadResult = await options.upload(stickerPackUpload.encFilePath, {
+            fileEncSha256B64: stickerPackUpload.fileEncSha256.toString('base64'),
+            mediaType: 'sticker-pack',
+            timeoutMs: options.mediaUploadTimeoutMs
+        });
+    }
+    finally {
+        fs.unlink(stickerPackUpload.encFilePath).catch(() => logger?.warn('failed to remove tmp file'));
+    }
+    const obj = {
+        name,
+        publisher,
+        stickerPackId: stickerPackIdValue,
+        packDescription: description,
+        stickerPackOrigin: proto.Message.StickerPackMessage.StickerPackOrigin.USER_CREATED,
+        stickerPackSize: zipBuffer.length,
+        stickers: stickerMetadata,
+        fileSha256: stickerPackUpload.fileSha256,
+        fileEncSha256: stickerPackUpload.fileEncSha256,
+        mediaKey: stickerPackUpload.mediaKey,
+        directPath: stickerPackUploadResult.directPath,
+        fileLength: stickerPackUpload.fileLength,
+        mediaKeyTimestamp: unixTimestampSeconds(),
+        trayIconFileName
+    };
+    try {
+        let thumbnailBuffer;
+        if (hasSharp) {
+            thumbnailBuffer = await lib.sharp.default(coverBuffer).resize(252, 252).jpeg().toBuffer();
+        }
+        else if (hasImage) {
+            thumbnailBuffer = await new lib.image.Transformer(coverBuffer).resize(252, 252).jpeg();
+        }
+        else if (hasJimp) {
+            const jimpImage = await lib.jimp.Jimp.read(coverBuffer);
+            thumbnailBuffer = await jimpImage.resize({ w: 252, h: 252 }).getBuffer('image/jpeg');
+        }
+        else {
+            throw new Error('No image processing library available for thumbnail generation');
+        }
+        if (!thumbnailBuffer || thumbnailBuffer.length === 0) {
+            throw new Error('Failed to generate thumbnail buffer');
+        }
+        const thumbUpload = await encryptedStream(thumbnailBuffer, 'thumbnail-sticker-pack', {
+            logger,
+            opts: options.options,
+            mediaKey: stickerPackUpload.mediaKey
+        });
+        let thumbUploadResult;
+        try {
+            thumbUploadResult = await options.upload(thumbUpload.encFilePath, {
+                fileEncSha256B64: thumbUpload.fileEncSha256.toString('base64'),
+                mediaType: 'thumbnail-sticker-pack',
+                timeoutMs: options.mediaUploadTimeoutMs
+            });
+        }
+        finally {
+            fs.unlink(thumbUpload.encFilePath).catch(() => logger?.warn('failed to remove tmp file'));
+        }
+        Object.assign(obj, {
+            thumbnailDirectPath: thumbUploadResult.directPath,
+            thumbnailSha256: thumbUpload.fileSha256,
+            thumbnailEncSha256: thumbUpload.fileEncSha256,
+            thumbnailHeight: 252,
+            thumbnailWidth: 252,
+            imageDataHash: sha256(thumbnailBuffer).toString('base64')
+        });
+    }
+    catch (error) {
+        logger?.warn(`Thumbnail generation failed: ${error}`);
+    }
+    if (cacheableKey) {
+        logger?.debug({ cacheableKey }, 'set cache (background)');
+        options.mediaCache.set(cacheableKey, WAProto.Message.StickerPackMessage.encode(obj).finish());
+    }
+    return WAProto.Message.StickerPackMessage.fromObject(obj);
+};
+
+const buttonLimitFor = buttons => buttons[0]?.name === 'quick_reply'
+    ? NATIVE_FLOW_BUTTON_LIMIT.quickReply
+    : NATIVE_FLOW_BUTTON_LIMIT.other;
+
+export const nativeFlowButtonsViolateConstraints = (buttons = []) => {
+    if (!buttons.length) {
+        return false;
+    }
+    const isQuickReply = button => button?.name === 'quick_reply';
+    const firstIsQuickReply = isQuickReply(buttons[0]);
+    if (buttons.length > buttonLimitFor(buttons)) {
+        return true;
+    }
+    return !buttons.slice(1).every(button => {
+        const mapped = getNativeFlowNameByButtonName(button?.name);
+        const nameAllowed = mapped == null || WEB_SUPPORTED_INTERACTIVE_FLOWS.includes(mapped);
+        return nameAllowed && firstIsQuickReply === isQuickReply(button);
+    });
+};
+
+const warnOnNativeFlowConstraints = (buttons, logger) => {
+    if (!logger?.warn || !nativeFlowButtonsViolateConstraints(buttons)) {
+        return;
+    }
+    const limit = buttonLimitFor(buttons);
+    const kinds = [...new Set(buttons.map(button => button?.name))];
+    logger.warn({ buttons: buttons.length, limit, kinds }, 'these native flow buttons break the client\'s button constraints, '
+        + 'so it cannot work out a flow name and draws the whole message as unsupported: keep every button the same kind as the first '
+        + `and at most ${limit} of them`);
+};
+
+const prepareNativeFlowButtons = (message, options) => {
+    const buttons = message.nativeFlow;
+    const isButtonsFieldArray = Array.isArray(buttons);
+    const correctedField = isButtonsFieldArray ? buttons : buttons.buttons;
+    const messageParamsJson = {};
+
+    if (hasOptionalProperty(message, 'offerText') && !!message.offerText) {
+        Object.assign(messageParamsJson, {
+            limited_time_offer: {
+                text: message.offerText || LIBRARY_NAME,
+                url: message.offerUrl || DONATE_URL,
+                copy_code: message.offerCode,
+                expiration_time: message.offerExpiration
+            }
+        });
+    }
+    if (hasOptionalProperty(message, 'optionText') && !!message.optionText) {
+        Object.assign(messageParamsJson, {
+            bottom_sheet: {
+                in_thread_buttons_limit: 1,
+                divider_indices: Array.from({ length: correctedField.length }, (_, index) => index),
+                list_title: message.optionTitle || '📄 Select Options',
+                button_title: message.optionText
+            }
+        });
+    }
+    const prepared = correctedField.map(button => {
+            const buttonText = button.text || button.buttonText;
+            const buttonIcon = button.icon?.toUpperCase();
+            if (hasOptionalProperty(button, 'id') && !!button.id) {
+                return {
+                    name: 'quick_reply',
+                    buttonParamsJson: JSON.stringify({
+                        display_text: buttonText || '👉🏻 Click',
+                        id: button.id,
+                        icon: buttonIcon
+                    })
+                };
+            }
+            else if (hasOptionalProperty(button, 'copy') && !!button.copy) {
+                return {
+                    name: 'cta_copy',
+                    buttonParamsJson: JSON.stringify({
+                        display_text: buttonText || '📋 Copy',
+                        copy_code: button.copy,
+                        icon: buttonIcon
+                    })
+                };
+            }
+            else if (hasOptionalProperty(button, 'url') && !!button.url) {
+                return {
+                    name: 'cta_url',
+                    buttonParamsJson: JSON.stringify({
+                        display_text: buttonText || '🌐 Visit',
+                        url: button.url,
+                        merchant_url: button.url,
+                        webview_interaction: button.useWebview,
+                        icon: buttonIcon
+                    })
+                };
+            }
+            else if (hasOptionalProperty(button, 'call') && !!button.call) {
+                return {
+                    name: 'cta_call',
+                    buttonParamsJson: JSON.stringify({
+                        display_text: buttonText || '📞 Call',
+                        phone_number: button.call,
+                        icon: buttonIcon
+                    })
+                };
+            }
+
+            else if (hasOptionalProperty(button, 'sections') && !!button.sections) {
+                return {
+                    name: 'single_select',
+                    buttonParamsJson: JSON.stringify({
+                        title: buttonText || '📋 Select',
+                        sections: button.sections,
+                        icon: buttonIcon
+                    })
+                };
+            }
+            return button;
+        });
+    warnOnNativeFlowConstraints(prepared, options?.logger);
+    return {
+        buttons: prepared,
+        messageParamsJson: JSON.stringify(messageParamsJson),
+        name: message.flowName || 'mixed',
+        messageVersion: 1
+    };
+};
+export const prepareDisappearingMessageSettingContent = (ephemeralExpiration) => {
+    ephemeralExpiration = ephemeralExpiration || 0;
+    const content = {
+        ephemeralMessage: {
+            message: {
+                protocolMessage: {
+                    type: WAProto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
+                    ephemeralExpiration
+                }
+            }
+        }
+    };
+    return WAProto.Message.fromObject(content);
+};
+
+export const generateForwardMessageContent = (message, forceForward) => {
+    let content = message.message;
+    if (!content) {
+        throw new Boom('no content in message', { statusCode: 400 });
+    }
+
+    content = normalizeMessageContent(content);
+    content = proto.Message.decode(proto.Message.encode(content).finish());
+    let key = Object.keys(content)[0];
+    let score = content?.[key]?.contextInfo?.forwardingScore || 0;
+    score += message.key.fromMe && !forceForward ? 0 : 1;
+    if (key === 'conversation') {
+        content.extendedTextMessage = { text: content[key] };
+        delete content.conversation;
+        key = 'extendedTextMessage';
+    }
+    const key_ = content?.[key];
+    if (score > 0) {
+        key_.contextInfo = { forwardingScore: score, isForwarded: true };
+    }
+    else {
+        key_.contextInfo = {};
+    }
+    return content;
+};
+export const hasNonNullishProperty = (message, key) => {
+    return message != null &&
+        typeof message === 'object' &&
+        key in message &&
+        message[key] != null;
+};
+export const hasOptionalProperty = (obj, key) => {
+    return obj != null &&
+        typeof obj === 'object' &&
+        key in obj &&
+        obj[key] != null;
+};
+
+export const hasValidAlbumMedia = (message) => {
+    return !!(message.imageMessage ||
+        message.videoMessage);
+};
+export const hasValidInteractiveHeader = (message) => {
+    return !!(message.imageMessage ||
+        message.videoMessage ||
+        message.documentMessage ||
+        message.productMessage ||
+        message.locationMessage);
+};
+
+const headerText = ({ title, subtitle }) => ({
+    ...(title ? { title } : {}),
+    ...(subtitle ? { subtitle } : {})
+});
+
+export const hasValidCarouselHeader = (message) => {
+    return !!(message.imageMessage ||
+        message.videoMessage ||
+        message.productMessage);
+};
+export const generateWAMessageContent = async (message, options) => {
+    var _a, _b;
+    let m = {};
+
+    if (hasNonNullishProperty(message, 'raw')) {
+        delete message.raw;
+        return message;
+    }
+    else if (hasNonNullishProperty(message, 'richLink')) {
+        const { text, url, title, description, image, large = true, previewType, thumbnailWidth, ...rest } = message.richLink;
+        if (!url || typeof url !== 'string') {
+            throw new Boom('richLink needs a url', { statusCode: 400 });
+        }
+        let body = text ?? url;
+        if (!body.includes(url)) {
+            body = `${body}\n\n${url}`;
+        }
+        const extContent = {
+            ...rest,
+            text: body,
+            matchedText: url,
+            title,
+            description,
+            previewType: previewType ?? 0
+        };
+        if (image) {
+            const thumbnails = await prepareLinkThumbnail(image, options, { thumbnailWidth, upload: large });
+            extContent.jpegThumbnail = thumbnails.jpegThumbnail;
+            const hq = thumbnails.highQualityThumbnail;
+            if (hq) {
+                extContent.thumbnailDirectPath = hq.directPath;
+                extContent.mediaKey = hq.mediaKey;
+                extContent.mediaKeyTimestamp = hq.mediaKeyTimestamp;
+                extContent.thumbnailSha256 = hq.fileSha256;
+                extContent.thumbnailEncSha256 = hq.fileEncSha256;
+                extContent.thumbnailWidth = hq.width;
+                extContent.thumbnailHeight = hq.height;
+            }
+        }
+        m.extendedTextMessage = trimEmptyValues(extContent);
+    }
+    else if (hasNonNullishProperty(message, 'text')) {
+        const extContent = { text: message.text };
+        let urlInfo = message.linkPreview;
+        if (typeof urlInfo === 'undefined') {
+            urlInfo = await generateLinkPreviewIfRequired(message.text, options.getUrlInfo, options.logger);
+        }
+        if (urlInfo?.image && !urlInfo.highQualityThumbnail) {
+            urlInfo = {
+                ...urlInfo,
+                ...(await prepareLinkThumbnail(urlInfo.image, options, {
+                    thumbnailWidth: urlInfo.thumbnailWidth,
+                    upload: urlInfo.large !== false
+                }))
+            };
+        }
+        if (urlInfo) {
+            extContent.matchedText = urlInfo['matched-text'];
+            extContent.jpegThumbnail = urlInfo.jpegThumbnail;
+            extContent.description = urlInfo.description;
+            extContent.title = urlInfo.title;
+            extContent.previewType = urlInfo.previewType ?? 0;
+            extContent.linkPreviewMetadata = urlInfo.linkPreviewMetadata;
+            const img = urlInfo.highQualityThumbnail;
+            if (img) {
+                extContent.thumbnailDirectPath = img.directPath;
+                extContent.mediaKey = img.mediaKey;
+                extContent.mediaKeyTimestamp = img.mediaKeyTimestamp;
+                extContent.thumbnailWidth = img.width;
+                extContent.thumbnailHeight = img.height;
+                extContent.thumbnailSha256 = img.fileSha256;
+                extContent.thumbnailEncSha256 = img.fileEncSha256;
+            }
+        }
+        const faviconData = message.favicon;
+        if (faviconData && typeof options.upload === 'function') {
+            const { imageMessage } = await prepareWAMessageMedia({
+                image: faviconData
+            }, options);
+            extContent.faviconMMSMetadata = {
+                thumbnailDirectPath: imageMessage.directPath,
+                mediaKey: imageMessage.mediaKey,
+                mediaKeyTimestamp: imageMessage.mediaKeyTimestamp,
+                thumbnailWidth: 32,
+                thumbnailHeight: 32,
+                thumbnailSha256: imageMessage.fileSha256,
+                thumbnailEncSha256: imageMessage.fileEncSha256
+            };
+        }
+        if (options.backgroundColor != null) {
+            extContent.backgroundArgb = await assertColor(options.backgroundColor);
+        }
+        if (options.textColor != null) {
+            extContent.textArgb = await assertColor(options.textColor);
+        }
+        if (options.font != null) {
+            extContent.font = options.font;
+        }
+        if (hasNonNullishProperty(message, 'socialPreview')) {
+            if (!extContent.matchedText) {
+                options.logger?.warn?.('socialPreview rides on a link preview and this message has no matched link, '
+                    + 'so nothing is attached to anything. Adding the link fixes this warning but not the rendering: '
+                    + 'no client reads these fields back out of a message you send, so socialPreview is for decoding '
+                    + 'what Meta sends, not for drawing your own card');
+            }
+            Object.assign(extContent, buildSocialPreview(message.socialPreview));
+        }
+        m.extendedTextMessage = extContent;
+    }
+    else if (hasNonNullishProperty(message, 'contacts')) {
+        const contactLen = message.contacts.contacts.length;
+        if (!contactLen) {
+            throw new Boom('require atleast 1 contact', { statusCode: 400 });
+        }
+        if (contactLen === 1) {
+            m.contactMessage = WAProto.Message.ContactMessage.create(message.contacts.contacts[0]);
+        }
+        else {
+            m.contactsArrayMessage = WAProto.Message.ContactsArrayMessage.create(message.contacts);
+        }
+    }
+    else if (hasNonNullishProperty(message, 'location')) {
+        m.locationMessage = WAProto.Message.LocationMessage.create(message.location);
+    }
+    else if (hasNonNullishProperty(message, 'react')) {
+        if (!message.react.senderTimestampMs) {
+            message.react.senderTimestampMs = Date.now();
+        }
+        m.reactionMessage = WAProto.Message.ReactionMessage.create(message.react);
+    }
+    else if (hasNonNullishProperty(message, 'delete')) {
+        m.protocolMessage = {
+            key: message.delete,
+            type: WAProto.Message.ProtocolMessage.Type.REVOKE
+        };
+    }
+    else if (hasNonNullishProperty(message, 'forward')) {
+        m = generateForwardMessageContent(message.forward, message.force);
+    }
+    else if (hasNonNullishProperty(message, 'disappearingMessagesInChat')) {
+        const exp = typeof message.disappearingMessagesInChat === 'boolean'
+            ? message.disappearingMessagesInChat
+                ? WA_DEFAULT_EPHEMERAL
+                : 0
+            : message.disappearingMessagesInChat;
+        m = prepareDisappearingMessageSettingContent(exp);
+    }
+    else if (hasNonNullishProperty(message, 'groupInvite')) {
+        m.groupInviteMessage = {};
+        m.groupInviteMessage.inviteCode = message.groupInvite.inviteCode;
+        m.groupInviteMessage.inviteExpiration = message.groupInvite.inviteExpiration;
+        m.groupInviteMessage.caption = message.groupInvite.text;
+        m.groupInviteMessage.groupJid = message.groupInvite.jid;
+        m.groupInviteMessage.groupName = message.groupInvite.subject;
+
+        if (options.getProfilePicUrl) {
+            const pfpUrl = await options.getProfilePicUrl(message.groupInvite.jid, 'preview');
+            if (pfpUrl) {
+                const resp = await fetch(pfpUrl, { method: 'GET', dispatcher: options?.options?.dispatcher });
+                if (resp.ok) {
+                    const buf = Buffer.from(await resp.arrayBuffer());
+                    m.groupInviteMessage.jpegThumbnail = buf;
+                }
+            }
+        }
+    }
+    else if (hasNonNullishProperty(message, 'stickers')) {
+        m.stickerPackMessage = await prepareStickerPackMessage(message, options);
+    }
+    else if (hasNonNullishProperty(message, 'pin')) {
+        m.pinInChatMessage = {};
+        m.messageContextInfo = {};
+        m.pinInChatMessage.key = message.pin;
+        m.pinInChatMessage.type = message.type;
+        m.pinInChatMessage.senderTimestampMs = Date.now();
+        m.messageContextInfo.messageAddOnDurationInSecs = message.type === 1 ? message.time || 86400 : 0;
+    }
+    else if (hasNonNullishProperty(message, 'keep')) {
+        m.keepInChatMessage = {};
+        m.keepInChatMessage.key = message.keep;
+        m.keepInChatMessage.keepType = message.type;
+        m.keepInChatMessage.timestampMs = Date.now();
+    }
+    else if (hasNonNullishProperty(message, 'flowReply')) {
+        m.interactiveResponseMessage = {
+            body: {
+                format: message.flowReply.format || proto.Message.InteractiveResponseMessage.Body.Format.DEFAULT,
+                text: message.flowReply.text
+            },
+            nativeFlowResponseMessage: {
+                name: message.flowReply.name,
+                paramsJson: message.flowReply.paramsJson || '{}',
+                version: message.flowReply.version || 1
+            }
+        };
+    }
+    else if (hasNonNullishProperty(message, 'buttonReply')) {
+        switch (message.type) {
+            case 'template':
+                m.templateButtonReplyMessage = {
+                    selectedDisplayText: message.buttonReply.displayText,
+                    selectedId: message.buttonReply.id,
+                    selectedIndex: message.buttonReply.index
+                };
+                break;
+            case 'plain':
+                m.buttonsResponseMessage = {
+                    selectedButtonId: message.buttonReply.id,
+                    selectedDisplayText: message.buttonReply.displayText,
+                    type: proto.Message.ButtonsResponseMessage.Type.DISPLAY_TEXT
+                };
+                break;
+        }
+    }
+    else if (hasNonNullishProperty(message, 'listReply')) {
+        m.listResponseMessage = {
+            description: message.listReply.description,
+            listType: proto.Message.ListResponseMessage.ListType.SINGLE_SELECT,
+            singleSelectReply: {
+                selectedRowId: message.listReply.id
+            },
+            title: message.listReply.title
+        };
+    }
+    else if (hasOptionalProperty(message, 'ptv') && message.ptv) {
+        const { videoMessage } = await prepareWAMessageMedia({ video: message.video }, options);
+        m.ptvMessage = videoMessage;
+    }
+    else if (hasNonNullishProperty(message, 'product')) {
+        m.productMessage = await prepareProductMessage(message, options);
+    }
+    else if (hasNonNullishProperty(message, 'event')) {
+        m.eventMessage = {};
+        const startTime = eventSeconds(message.event.startDate, 'startDate');
+        if (message.event.call && options.getCallLink) {
+            const token = await options.getCallLink(message.event.call, { startTime });
+            m.eventMessage.joinLink = (message.event.call === 'audio' ? CALL_AUDIO_PREFIX : CALL_VIDEO_PREFIX) + token;
+        }
+        m.messageContextInfo = {
+
+            messageSecret: message.event.messageSecret || randomBytes(32)
+        };
+        m.eventMessage.name = message.event.name;
+        m.eventMessage.description = message.event.description;
+        m.eventMessage.startTime = startTime;
+        m.eventMessage.endTime = message.event.endDate ? eventSeconds(message.event.endDate, 'endDate') : undefined;
+        m.eventMessage.isCanceled = message.event.isCancelled ?? false;
+        m.eventMessage.extraGuestsAllowed = message.event.extraGuestsAllowed;
+        m.eventMessage.isScheduleCall = message.event.isScheduleCall ?? false;
+        m.eventMessage.location = message.event.location;
+    }
+    else if (hasNonNullishProperty(message, 'poll')) {
+        (_a = message.poll).selectableCount || (_a.selectableCount = 0);
+        (_b = message.poll).toAnnouncementGroup || (_b.toAnnouncementGroup = false);
+        if (!Array.isArray(message.poll.values)) {
+            throw new Boom('Invalid poll values', { statusCode: 400 });
+        }
+        if (message.poll.selectableCount < 0 || message.poll.selectableCount > message.poll.values.length) {
+            throw new Boom(`poll.selectableCount in poll should be >= 0 and <= ${message.poll.values.length}`, {
+                statusCode: 400
+            });
+        }
+        let hasPollOptionImage = false;
+        const pollOptions = [];
+        for (const value of message.poll.values) {
+            if (typeof value === 'string') {
+                pollOptions.push({ optionName: value });
+                continue;
+            }
+            if (!value?.name) {
+                throw new Boom('Each photo poll option needs a name', { statusCode: 400 });
+            }
+            if (value.optionHash) {
+                hasPollOptionImage = true;
+                pollOptions.push({ optionName: value.name, optionHash: value.optionHash });
+                continue;
+            }
+            if (!value.image) {
+                pollOptions.push({ optionName: value.name });
+                continue;
+            }
+            const prepared = await prepareWAMessageMedia({ image: value.image }, options);
+            hasPollOptionImage = true;
+            pollOptions.push({
+                optionName: value.name,
+                optionHash: getPollOptionHash(value.name, prepared.imageMessage?.fileSha256)
+            });
+        }
+        const usesExtendedPollSettings = Boolean(message.poll.endDate) ||
+            message.poll.hideVoter === true ||
+            message.poll.canAddOption === true;
+        const pollCreationMessage = {
+            name: message.poll.name,
+            selectableOptionsCount: message.poll.selectableCount,
+            options: pollOptions,
+            endTime: message.poll.endDate ? message.poll.endDate.getTime() : undefined,
+
+            hideParticipantName: message.poll.hideVoter || undefined,
+            allowAddOption: message.poll.canAddOption || undefined
+        };
+        if (hasPollOptionImage) {
+            pollCreationMessage.pollContentType = proto.Message.PollContentType.IMAGE;
+        }
+        if (message.poll.toAnnouncementGroup) {
+
+            m.pollCreationMessageV2 = pollCreationMessage;
+        }
+        else {
+
+            if (message.poll.pollType === 1) {
+                if (!message.poll.correctAnswer) {
+                    throw new Boom('No "correctAnswer" provided for quiz', { statusCode: 400 });
+                }
+                m.pollCreationMessageV5 = {
+
+                    ...pollCreationMessage,
+                    correctAnswer: {
+                        optionName: message.poll.correctAnswer.toString()
+                    },
+                    pollType: 1,
+                    selectableOptionsCount: 1
+                };
+            }
+            else if (hasPollOptionImage) {
+
+                m.pollCreationMessageV3 = pollCreationMessage;
+            }
+            else if (usesExtendedPollSettings) {
+
+                m.pollCreationMessageV6 = pollCreationMessage;
+            }
+            else if (message.poll.selectableCount === 1) {
+
+                m.pollCreationMessageV3 = pollCreationMessage;
+            }
+            else {
+
+                m.pollCreationMessage = pollCreationMessage;
+            }
+        }
+        m.messageContextInfo = {
+
+            messageSecret: message.poll.messageSecret || randomBytes(32)
+        };
+    }
+
+    else if (hasNonNullishProperty(message, 'pollResult')) {
+        const pollResultSnapshotMessage = {
+            name: message.pollResult.name,
+            pollVotes: message.pollResult.votes.map(vote => ({
+                optionName: vote.name,
+                optionVoteCount: parseInt(vote.voteCount)
+            }))
+        };
+        if (message.pollResult.pollType === 1) {
+            pollResultSnapshotMessage.pollType = proto.Message.PollType.QUIZ;
+            m.pollResultSnapshotMessageV3 = pollResultSnapshotMessage;
+        }
+        else {
+            pollResultSnapshotMessage.pollType = proto.Message.PollType.POLL;
+            m.pollResultSnapshotMessage = pollResultSnapshotMessage;
+        }
+    }
+
+    else if (hasNonNullishProperty(message, 'pollUpdate')) {
+        if (!message.pollUpdate.key) {
+            throw new Boom('Message key is required', { statusCode: 400 });
+        }
+        if (!message.pollUpdate.vote) {
+            throw new Boom('Encrypted vote payload is required', { statusCode: 400 });
+        }
+        m.pollUpdateMessage = {
+            metadata: message.pollUpdate.metadata,
+            pollCreationMessageKey: message.pollUpdate.key,
+            senderTimestampMs: Date.now(),
+            vote: message.pollUpdate.vote
+        };
+    }
+
+    else if (hasNonNullishProperty(message, 'paymentInviteServiceType')) {
+        m.paymentInviteMessage = {
+            expiryTimestamp: Date.now(),
+            serviceType: message.paymentInviteServiceType
+        };
+    }
+
+    else if (hasNonNullishProperty(message, 'orderText')) {
+        if (!Buffer.isBuffer(message.thumbnail)) {
+            throw new Boom('Must provide thumbnail buffer in order message', { statusCode: 400 });
+        }
+        m.orderMessage = {
+            itemCount: 1,
+            messageVersion: 1,
+            orderTitle: LIBRARY_NAME,
+            status: proto.Message.OrderMessage.OrderStatus.INQUIRY,
+            surface: proto.Message.OrderMessage.OrderSurface.CATALOG,
+            token: generateMessageIDV2(),
+            totalAmount1000: 1000,
+            totalCurrencyCode: 'IDR',
+            ...message,
+            message: message.orderText
+        };
+        delete m.orderMessage.orderText;
+    }
+
+    else if (hasNonNullishProperty(message, 'album')) {
+        if (!Array.isArray(message.album)) {
+            throw new Boom('Invalid album type. Expected an array.', { statusCode: 400 });
+        }
+        let videoCount = 0;
+        for (let i = 0; i < message.album.length; i++) {
+            if (message.album[i].video)
+                videoCount++;
+        }
+        ;
+        let imageCount = 0;
+        for (let i = 0; i < message.album.length; i++) {
+            if (message.album[i].image)
+                imageCount++;
+        }
+        ;
+        if ((videoCount + imageCount) < 2) {
+            throw new Boom('Minimum provide 2 media to upload album message', { statusCode: 400 });
+        }
+        m.albumMessage = {
+            expectedImageCount: imageCount,
+            expectedVideoCount: videoCount,
+            ...(message.caption ? { caption: String(message.caption) } : {})
+        };
+    }
+    else if (hasNonNullishProperty(message, 'sharePhoneNumber')) {
+        m.protocolMessage = {
+            type: proto.Message.ProtocolMessage.Type.SHARE_PHONE_NUMBER
+        };
+    }
+    else if (hasNonNullishProperty(message, 'requestPhoneNumber')) {
+        m.requestPhoneNumberMessage = {};
+    }
+    else if (hasNonNullishProperty(message, 'limitSharing')) {
+        m.protocolMessage = {
+            type: proto.Message.ProtocolMessage.Type.LIMIT_SHARING,
+            limitSharing: {
+                sharingLimited: message.limitSharing === true,
+                trigger: 1,
+                limitSharingSettingTimestamp: Date.now(),
+                initiatedByMe: true
+            }
+        };
+    }
+    else if (hasNonNullishProperty(message, 'music')) {
+        m.musicMessage = buildMusicMessage(message.music);
+    }
+    else if (hasNonNullishProperty(message, 'splitPayment')) {
+        m.splitPaymentMessage = buildSplitPayment(message.splitPayment);
+    }
+    else if (hasNonNullishProperty(message, 'splitPaymentUpdate')) {
+        m.splitPaymentUpdateMessage = buildSplitPaymentUpdate(message.splitPaymentUpdate);
+    }
+    else if (hasNonNullishProperty(message, 'paymentReminder')) {
+        m.paymentReminderMessage = buildPaymentReminder(message.paymentReminder);
+    }
+    else if (hasNonNullishProperty(message, 'song')) {
+        const { audio, artwork, title, author, url, largeThumbnail = true, thumbnailWidth = 640, mediaType = 1, ...rest } = message.song;
+        if (!audio) {
+            throw new Boom('song needs audio', { statusCode: 400 });
+        }
+        const mimetype = rest.mimetype ?? 'audio/mpeg';
+        if (rest.ptt === true && !/opus/i.test(mimetype)) {
+            options.logger?.warn?.({ mimetype }, 'ptt asks for a voice note but this is not opus, and nothing here transcodes it');
+        }
+        m = await prepareWAMessageMedia({ audio, ...rest, mimetype }, options);
+        const thumbnail = artwork ? await songThumbnail(artwork, thumbnailWidth, options.logger) : undefined;
+        m.audioMessage.contextInfo = {
+            ...m.audioMessage.contextInfo,
+            externalAdReply: trimEmptyValues({
+                title: title || LIBRARY_NAME,
+                body: author,
+                thumbnail,
+                mediaType,
+                renderLargerThumbnail: !!largeThumbnail,
+                showAdAttribution: false,
+                sourceUrl: url,
+                mediaUrl: url
+            })
+        };
+    }
+    else {
+        m = await prepareWAMessageMedia(message, options);
+    }
+
+    if (hasNonNullishProperty(message, 'buttons')) {
+        const buttonsMessage = {
+            buttons: message.buttons.map(button => {
+
+                const buttonText = button.text || button.buttonText;
+                if (hasOptionalProperty(button, 'sections')) {
+                    return {
+                        nativeFlowInfo: {
+                            name: 'single_select',
+                            paramsJson: JSON.stringify({
+                                title: buttonText,
+                                sections: button.sections
+                            })
+                        },
+                        type: ButtonType.NATIVE_FLOW
+                    };
+                }
+                else if (hasOptionalProperty(button, 'name')) {
+                    return {
+                        nativeFlowInfo: {
+                            name: button.name,
+                            paramsJson: button.paramsJson
+                        },
+                        type: ButtonType.NATIVE_FLOW
+                    };
+                }
+                return {
+                    buttonId: button.id || button.buttonId,
+                    buttonText: typeof buttonText === 'string' ? { displayText: buttonText } : buttonText,
+                    type: button.type || ButtonType.RESPONSE
+                };
+            })
+        };
+        if (hasOptionalProperty(message, 'text')) {
+            buttonsMessage.contentText = message.text;
+            buttonsMessage.headerType = ButtonHeaderType.EMPTY;
+        }
+        else {
+            if (hasOptionalProperty(message, 'caption')) {
+                buttonsMessage.contentText = message.caption;
+            }
+            const type = Object.keys(m)[0].replace('Message', '').toUpperCase();
+            buttonsMessage.headerType = ButtonHeaderType[type];
+            Object.assign(buttonsMessage, m);
+        }
+        if (hasOptionalProperty(message, 'footer')) {
+            buttonsMessage.footerText = message.footer;
+        }
+        m = { buttonsMessage };
+    }
+    else if (hasNonNullishProperty(message, 'sections')) {
+        const listMessage = {
+            sections: message.sections,
+            buttonText: message.buttonText,
+            title: message.title,
+            footerText: message.footer,
+            description: message.text,
+            listType: ListType.SINGLE_SELECT
+        };
+        m = { listMessage };
+    }
+
+    else if (hasNonNullishProperty(message, 'templateButtons')) {
+        const hydratedTemplate = {
+            hydratedButtons: message.templateButtons.map((button, i) => {
+                const buttonText = button.text || button.buttonText;
+                if (hasOptionalProperty(button, 'id')) {
+                    return {
+                        index: i,
+                        quickReplyButton: {
+                            displayText: buttonText || '👉🏻 Click',
+                            id: button.id
+                        }
+                    };
+                }
+                else if (hasOptionalProperty(button, 'url')) {
+                    return {
+                        index: i,
+                        urlButton: {
+                            displayText: buttonText || '🌐 Visit',
+                            url: button.url
+                        }
+                    };
+                }
+                else if (hasOptionalProperty(button, 'call')) {
+                    return {
+                        index: i,
+                        callButton: {
+                            displayText: buttonText || '📞 Call',
+                            phoneNumber: button.call
+                        }
+                    };
+                }
+                button.index = button.index || i;
+                return button;
+            })
+        };
+        if (hasOptionalProperty(message, 'text')) {
+            hydratedTemplate.hydratedContentText = message.text;
+        }
+        else {
+            if (hasOptionalProperty(message, 'caption')) {
+                hydratedTemplate.hydratedTitleText = message.title;
+                hydratedTemplate.hydratedContentText = message.caption;
+            }
+            ;
+            Object.assign(hydratedTemplate, m);
+        }
+        if (hasOptionalProperty(message, 'footer')) {
+            hydratedTemplate.hydratedFooterText = message.footer;
+        }
+        hydratedTemplate.templateId = message.id || 'template-' + Date.now();
+        m = {
+            templateMessage: {
+                hydratedFourRowTemplate: hydratedTemplate,
+                hydratedTemplate: hydratedTemplate
+            }
+        };
+    }
+    else if (hasNonNullishProperty(message, 'nativeFlow')) {
+        const interactiveMessage = {
+            nativeFlowMessage: prepareNativeFlowButtons(message, options)
+        };
+        if (hasNonNullishProperty(message, 'bloksWidget')) {
+            interactiveMessage.bloksWidget = message.bloksWidget;
+        }
+        if (hasOptionalProperty(message, 'bizJid')) {
+            interactiveMessage.collectionMessage = {
+                bizJid: message.bizJid,
+                id: message.id,
+                messageVersion: 1
+            };
+        }
+        else if (hasOptionalProperty(message, 'shopSurface')) {
+            interactiveMessage.shopStorefrontMessage = {
+                surface: message.shopSurface,
+                id: message.id,
+                messageVersion: 1
+            };
+        }
+        if (hasOptionalProperty(message, 'text')) {
+            interactiveMessage.body = { text: message.text };
+        }
+        else {
+            if (hasOptionalProperty(message, 'caption')) {
+                const isValidHeader = hasValidInteractiveHeader(m);
+                if (!isValidHeader) {
+                    throw new Boom('Invalid media type for interactive message header', { statusCode: 400 });
+                }
+                interactiveMessage.header = {
+                    ...headerText(message),
+                    hasMediaAttachment: isValidHeader
+                };
+                interactiveMessage.body = { text: message.caption };
+            }
+            if (hasOptionalProperty(message, 'thumbnail') && !!message.thumbnail) {
+                interactiveMessage.jpegThumbnail = message.thumbnail;
+            }
+            Object.assign(interactiveMessage.header, m);
+        }
+        if (hasOptionalProperty(message, 'audioFooter')) {
+            const { audioMessage } = await prepareWAMessageMedia({
+                audio: message.audioFooter
+            }, options);
+            interactiveMessage.footer = {
+                audioMessage,
+                hasMediaAttachment: true
+            };
+        }
+        else if (hasOptionalProperty(message, 'footer')) {
+            interactiveMessage.footer = { text: message.footer };
+        }
+        m = { interactiveMessage };
+    }
+    else if (hasNonNullishProperty(message, 'cards')) {
+        const interactiveMessage = {
+            carouselMessage: {
+                cards: await Promise.all(message.cards.map(async (card) => {
+                    let carouselHeader = {};
+                    if (hasNonNullishProperty(card, 'product')) {
+                        carouselHeader.productMessage = await prepareProductMessage(card, options);
+                    }
+                    else {
+                        carouselHeader = await prepareWAMessageMedia(card, options).catch(() => ({}));
+                    }
+                    const isValidHeader = hasValidCarouselHeader(carouselHeader);
+                    if (!isValidHeader) {
+                        throw new Boom('Invalid media type for carousel card', { statusCode: 400 });
+                    }
+                    const carouselCard = {
+                        nativeFlowMessage: prepareNativeFlowButtons(card.nativeFlow ? card : [], options)
+                    };
+                    if (hasOptionalProperty(card, 'text')) {
+                        carouselCard.body = { text: card.text };
+                    }
+                    else {
+                        if (hasOptionalProperty(card, 'caption')) {
+                            carouselCard.header = {
+                                ...headerText(card),
+                                hasMediaAttachment: isValidHeader
+                            };
+                            carouselCard.body = { text: card.caption };
+                        }
+                        if (hasOptionalProperty(card, 'thumbnail') && !!card.thumbnail) {
+                            carouselCard.jpegThumbnail = card.thumbnail;
+                        }
+                        Object.assign(carouselCard.header, carouselHeader);
+                    }
+                    if (hasOptionalProperty(card, 'audioFooter')) {
+                        const { audioMessage } = await prepareWAMessageMedia({
+                            audio: card.audioFooter
+                        }, options);
+                        carouselCard.footer = {
+                            audioMessage,
+                            hasMediaAttachment: true
+                        };
+                    }
+                    else if (hasOptionalProperty(card, 'footer')) {
+                        carouselCard.footer = { text: card.footer };
+                    }
+                    return carouselCard;
+                })),
+                carouselCardType: CarouselCardType.UNKNOWN,
+                messageVersion: 1
+            }
+        };
+        if (hasOptionalProperty(message, 'text')) {
+            interactiveMessage.body = { text: message.text };
+        }
+        if (hasOptionalProperty(message, 'footer')) {
+            interactiveMessage.footer = { text: message.footer };
+        }
+        m = { interactiveMessage };
+    }
+
+    else if (hasNonNullishProperty(message, 'requestPaymentFrom')) {
+        const requestPaymentMessage = {
+            amount: {
+                currencyCode: 'IDR',
+                offset: 1000,
+                value: 1000
+            },
+            amount1000: 1000,
+            currencyCodeIso4217: 'IDR',
+            expiryTimestamp: Date.now(),
+            noteMessage: m,
+            requestFrom: message.requestPaymentFrom,
+            ...message
+        };
+        delete requestPaymentMessage.requestPaymentFrom;
+        if (hasNonNullishProperty(m, 'extendedTextMessage') || hasNonNullishProperty(m, 'stickerMessage')) {
+            Object.assign(requestPaymentMessage.noteMessage, m);
+        }
+        else {
+            throw new Boom('Invalid message type for request payment note message', { statusCode: 400 });
+        }
+        m = { requestPaymentMessage };
+    }
+
+    else if (hasNonNullishProperty(message, 'invoiceNote')) {
+        const attachment = m.imageMessage || m.documentMessage;
+        const type = Object.keys(m)[0].replace('Message', '').toUpperCase();
+        const invoiceMessage = {
+            attachmentType: proto.Message.InvoiceMessage.AttachmentType[type === 'DOCUMENT' ? 'PDF' : 'IMAGE'],
+            note: message.invoiceNote
+        };
+        if (attachment) {
+            const { directPath, fileEncSha256, fileSha256, jpegThumbnail = undefined, mediaKey, mediaKeyTimestamp, mimetype } = attachment;
+            Object.assign(invoiceMessage, {
+                attachmentDirectPath: directPath,
+                attachmentFileEncSha256: fileEncSha256,
+                attachmentFileSha256: fileSha256,
+                attachmentJpegThumbnail: jpegThumbnail,
+                attachmentMediaKey: mediaKey,
+                attachmentMediaKeyTimestamp: mediaKeyTimestamp,
+                attachmentMimetype: mimetype,
+                token: generateMessageIDV2()
+            });
+        }
+        else {
+            throw new Boom('Invalid media type for invoice message', { statusCode: 400 });
+        }
+        m = { invoiceMessage };
+    }
+
+    if (hasNonNullishProperty(message, 'statusLinkPreview')) {
+        const style = Number(message.statusLinkPreview.style ?? message.statusLinkPreview);
+        if (!Number.isInteger(style) || style < 0) {
+            throw new Boom('statusLinkPreview style must be a non-negative integer', { statusCode: 400 });
+        }
+        m.statusLinkPreviewMetadata = { style };
+    }
+    if (hasOptionalProperty(message, 'externalAdReply') && !!message.externalAdReply) {
+        const messageType = Object.keys(m)[0];
+        const key = m[messageType];
+        const content = message.externalAdReply;
+        if ('thumbnail' in content && !Buffer.isBuffer(content.thumbnail)) {
+            throw new Boom('Thumbnail must in buffer type', { statusCode: 400 });
+        }
+        if (!content.url || typeof content.url !== 'string') {
+            content.url = DONATE_URL;
+        }
+        const externalAdReply = {
+            ...content,
+            body: content.body,
+            mediaType: content.mediaType || 1,
+            renderLargerThumbnail: content.largeThumbnail,
+            sourceUrl: content.url,
+            thumbnail: content.thumbnail,
+            title: content.title || LIBRARY_NAME
+        };
+        if (content.thumbnailUrl) {
+            externalAdReply.thumbnailUrl = content.thumbnailUrl;
+        }
+        if (content.mediaUrl) {
+            externalAdReply.mediaUrl = content.mediaUrl;
+        }
+        delete externalAdReply.subTitle;
+        delete externalAdReply.largeThumbnail;
+        delete externalAdReply.url;
+        if (!externalAdReply.thumbnail && !externalAdReply.thumbnailUrl) {
+            options.logger?.warn?.('externalAdReply has no thumbnail and no thumbnailUrl, so the card draws without a picture');
+        }
+        if ('contextInfo' in key && !!key.contextInfo) {
+            key.contextInfo.externalAdReply = { ...key.contextInfo.externalAdReply, ...externalAdReply };
+        }
+        else if (key) {
+            key.contextInfo = { externalAdReply };
+        }
+    }
+    if ((hasOptionalProperty(message, 'mentions') && message.mentions?.length) ||
+        (hasOptionalProperty(message, 'mentionAll') && message.mentionAll) ||
+        (hasOptionalProperty(message, 'groupMentions') && message.groupMentions?.length)) {
+        const messageType = Object.keys(m)[0];
+        const key = m[messageType];
+        if (key && typeof key === 'object') {
+            key.contextInfo = ('contextInfo' in key && key.contextInfo) ? key.contextInfo : {};
+            if (message.mentions?.length) {
+                key.contextInfo.mentionedJid = message.mentions;
+            }
+            if (message.mentionAll) {
+                key.contextInfo.nonJidMentions = 1;
+            }
+            if (message.groupMentions?.length) {
+                const normalized = message.groupMentions
+                    .filter((gm) => gm?.groupJid)
+                    .map((gm) => ({
+                        groupJid: `${String(gm.groupJid).split('@')[0]}@g.us`,
+                        groupSubject: gm.groupSubject
+                    }));
+                key.contextInfo.groupMentions = normalized;
+                const field = 'text' in key ? 'text' : 'caption' in key ? 'caption' : null;
+                if (field) {
+                    let body = key[field] || '';
+                    for (const gm of normalized) {
+                        const token = `@${gm.groupJid}`;
+                        if (!body.includes(token)) {
+                            body = body.length ? `${body} ${token}` : token;
+                        }
+                    }
+                    key[field] = body;
+                }
+            }
+        }
+    }
+    if (hasOptionalProperty(message, 'forwardedNewsletter') && !!message.forwardedNewsletter) {
+        const messageType = Object.keys(m)[0];
+        const key = m[messageType];
+        if (key && typeof key === 'object') {
+            const info = message.forwardedNewsletter;
+            const forwardedNewsletterMessageInfo = { newsletterJid: info.newsletterJid };
+            if (info.serverMessageId !== undefined) {
+                forwardedNewsletterMessageInfo.serverMessageId = Number(info.serverMessageId) || 0;
+            }
+            if (info.newsletterName !== undefined) {
+                forwardedNewsletterMessageInfo.newsletterName = info.newsletterName;
+            }
+            if (info.contentType !== undefined) {
+                forwardedNewsletterMessageInfo.contentType = info.contentType;
+            }
+            if (info.accessibilityText !== undefined) {
+                forwardedNewsletterMessageInfo.accessibilityText = info.accessibilityText;
+            }
+            key.contextInfo = ('contextInfo' in key && key.contextInfo) ? key.contextInfo : {};
+            key.contextInfo.forwardedNewsletterMessageInfo = forwardedNewsletterMessageInfo;
+            key.contextInfo.isForwarded = true;
+        }
+    }
+    if (hasOptionalProperty(message, 'contextInfo') && !!message.contextInfo) {
+        const messageType = Object.keys(m)[0];
+        const key = m[messageType];
+        if ('contextInfo' in key && !!key.contextInfo) {
+            key.contextInfo = { ...key.contextInfo, ...message.contextInfo };
+        }
+        else if (key) {
+            key.contextInfo = message.contextInfo;
+        }
+    }
+
+    if (hasOptionalProperty(message, 'groupStatus') && !!message.groupStatus) {
+        const messageType = Object.keys(m)[0];
+        const key = m[messageType];
+        if ('contextInfo' in key && !!key.contextInfo) {
+            key.contextInfo.isGroupStatus = message.groupStatus;
+        }
+        else if (key) {
+            key.contextInfo = {
+                isGroupStatus: message.groupStatus
+            };
+        }
+        m = { groupStatusMessageV2: { message: m } };
+        delete message.groupStatus;
+    }
+
+    if (hasOptionalProperty(message, 'spoiler') && !!message.spoiler) {
+        const messageType = Object.keys(m)[0];
+        const key = m[messageType];
+        if ('contextInfo' in key && !!key.contextInfo) {
+            key.contextInfo.isSpoiler = message.spoiler;
+        }
+        else if (key) {
+            key.contextInfo = {
+                isSpoiler: message.spoiler
+            };
+        }
+        m = { spoilerMessage: { message: m } };
+        delete message.spoiler;
+    }
+
+    else if (hasOptionalProperty(message, 'interactiveAsTemplate') && !!message.interactiveAsTemplate) {
+        if (!m.interactiveMessage) {
+            throw new Boom('Invalid message type for template', { statusCode: 400 });
+        }
+        m = {
+            templateMessage: {
+                interactiveMessageTemplate: m.interactiveMessage,
+                templateId: message.id || 'template-' + Date.now()
+            }
+        };
+        delete message.interactiveAsTemplate;
+    }
+
+    if (hasOptionalProperty(message, 'ephemeral') && !!message.ephemeral) {
+        m = { ephemeralMessage: { message: m } };
+        delete message.ephemeral;
+    }
+
+    const markInnerViewOnce = (inner) => {
+        const key = getContentType(inner);
+        const target = key && inner[key];
+        if (target && typeof target === 'object' && 'viewOnce' in proto.Message[key.charAt(0).toUpperCase() + key.slice(1)].prototype) {
+            target.viewOnce = true;
+        }
+    };
+    if (hasOptionalProperty(message, 'isLottie') && !!message.isLottie) {
+        m = { lottieStickerMessage: { message: m } };
+    }
+    else if (hasOptionalProperty(message, 'viewOnce') && !!message.viewOnce) {
+        markInnerViewOnce(m);
+        m = { viewOnceMessage: { message: m } };
+    }
+
+    else if (hasOptionalProperty(message, 'viewOnceV2') && !!message.viewOnceV2) {
+        markInnerViewOnce(m);
+        m = { viewOnceMessageV2: { message: m } };
+        delete message.viewOnceV2;
+    }
+
+    else if (hasOptionalProperty(message, 'viewOnceV2Extension') && !!message.viewOnceV2Extension) {
+        markInnerViewOnce(m);
+        m = { viewOnceMessageV2Extension: { message: m } };
+        delete message.viewOnceV2Extension;
+    }
+    if (hasOptionalProperty(message, 'edit')) {
+        m = {
+            protocolMessage: {
+                key: message.edit,
+                editedMessage: m,
+                timestampMs: Date.now(),
+                type: WAProto.Message.ProtocolMessage.Type.MESSAGE_EDIT
+            }
+        };
+    }
+    if (hasOptionalProperty(message, 'messageAssociation') && !!message.messageAssociation) {
+        m.messageContextInfo = m.messageContextInfo || {};
+        m.messageContextInfo.messageAssociation = message.messageAssociation;
+    }
+    if (shouldIncludeReportingToken(m)) {
+        m.messageContextInfo = m.messageContextInfo || {};
+        if (!m.messageContextInfo.messageSecret) {
+            m.messageContextInfo.messageSecret = randomBytes(32);
+        }
+    }
+    return WAProto.Message.create(m);
+};
+export const generateWAMessageFromContent = (jid, message, options) => {
+
+    if (!options.timestamp) {
+        options.timestamp = new Date();
+    }
+    const innerMessage = normalizeMessageContent(message);
+    const messageContextInfo = message.messageContextInfo;
+    const key = getContentType(innerMessage);
+    const timestamp = unixTimestampSeconds(options.timestamp);
+    const isNewsletter = isJidNewsletter(jid);
+    const { quoted, userJid } = options;
+    const quotedContentType = quoted ? getContentType(normalizeMessageContent(quoted.message)) : undefined;
+    if (quoted && (!quotedContentType || !key || !innerMessage[key])) {
+        options.logger?.warn?.({
+            jid,
+            quotedId: quoted.key?.id,
+            quotedContentType,
+            contentType: key
+        }, 'nothing quotable here, sending without the quote');
+    }
+    else if (quoted) {
+        const participant = quoted.key.fromMe
+            ? userJid
+            : quoted.participant || quoted.key.participant || quoted.key.remoteJid;
+        const normalizedQuoted = normalizeMessageContent(quoted.message);
+        const msgType = quotedContentType;
+        const quotedMsg = proto.Message.create({ [msgType]: normalizedQuoted[msgType] });
+        const quotedContent = quotedMsg[msgType];
+        if (typeof quotedContent === 'object' && quotedContent && 'contextInfo' in quotedContent) {
+            delete quotedContent.contextInfo;
+        }
+        const contextInfo = ('contextInfo' in innerMessage[key] && innerMessage[key]?.contextInfo) || {};
+        contextInfo.participant = jidNormalizedUser(participant);
+        contextInfo.stanzaId = quoted.key.id;
+        contextInfo.quotedMessage = quotedMsg;
+
+        if (!isNewsletter && jid !== quoted.key.remoteJid) {
+            contextInfo.remoteJid = quoted.key.remoteJid;
+        }
+        innerMessage[key].contextInfo = contextInfo;
+    }
+    if (
+
+    !!options?.ephemeralExpiration &&
+
+        key !== 'protocolMessage' &&
+
+        key !== 'ephemeralMessage' &&
+
+        !isNewsletter) {
+
+        innerMessage[key].contextInfo = {
+            ...(innerMessage[key].contextInfo || {}),
+            expiration: options.ephemeralExpiration || WA_DEFAULT_EPHEMERAL
+
+        };
+    }
+
+    if (messageContextInfo?.messageSecret && (isPnUser(jid) || isLidUser(jid))) {
+        messageContextInfo.deviceListMetadata = {
+            recipientKeyHash: randomBytes(10),
+            recipientTimestamp: unixTimestampSeconds()
+        };
+        messageContextInfo.deviceListMetadataVersion = 2;
+    }
+    message = WAProto.Message.create(message);
+    const messageJSON = {
+        key: {
+            remoteJid: jid,
+            fromMe: true,
+            id: options?.messageId || generateMessageIDV2()
+        },
+        message: message,
+        messageTimestamp: timestamp,
+        messageStubParameters: [],
+        participant: isJidGroup(jid) || isJidStatusBroadcast(jid) ? userJid : undefined,
+        status: WAMessageStatus.PENDING
+    };
+    return WAProto.WebMessageInfo.fromObject(messageJSON);
+};
+export const generateWAMessage = async (jid, content, options) => {
+
+    options.logger = options?.logger?.child({ msgId: options.messageId });
+
+    if (jid) {
+        options.jid = jid;
+    }
+    return generateWAMessageFromContent(jid, await generateWAMessageContent(content, options), options);
+};
+
+export const getContentType = (content) => {
+    if (content) {
+        const keys = Object.keys(content);
+        const key = keys.find(k => (k === 'conversation' || k.includes('Message')) && k !== 'senderKeyDistributionMessage');
+        return key;
+    }
+};
+
+export const FUTURE_PROOF_MESSAGE_KEYS = [
+    'acp2SettingMessage',
+    'associatedChildMessage',
+    'audioStickerMessage',
+    'botForwardedMessage',
+    'botGroupParticipantMessage',
+    'botInvokeMessage',
+    'botPlatformRegistrationSuccessMessage',
+    'botTaskMessage',
+    'documentWithCaptionMessage',
+    'editedMessage',
+    'ephemeralMessage',
+    'eventCoverImage',
+    'groupMentionedMessage',
+    'groupStatusMentionMessage',
+    'groupStatusMessage',
+    'groupStatusMessageV2',
+    'limitSharingMessage',
+    'lottieStickerMessage',
+    'newsletterAdminProfileMessage',
+    'newsletterAdminProfileMessageV2',
+    'newsletterAdminProfileStatusMessage',
+    'newsletterScheduledMessage',
+    'pollCreationMessageV4',
+    'pollCreationOptionImageMessage',
+    'questionMessage',
+    'questionReplyMessage',
+    'spoilerMessage',
+    'statusAddYours',
+    'statusMentionMessage',
+    'viewOnceMessage',
+    'viewOnceMessageV2',
+    'viewOnceMessageV2Extension'
+];
+
+const getFutureProofMessage = (message) => {
+    if (!message) {
+        return undefined;
+    }
+    for (const key of FUTURE_PROOF_MESSAGE_KEYS) {
+        const wrapper = message[key];
+        if (wrapper) {
+            return wrapper;
+        }
+    }
+    return undefined;
+};
+
+export const normalizeMessageContent = (content) => {
+    if (!content) {
+        return undefined;
+    }
+
+    for (let i = 0; i < 5; i++) {
+        const inner = getFutureProofMessage(content);
+        if (!inner) {
+            break;
+        }
+        content = inner.message;
+    }
+    return content;
+};
+
+export const extractMessageContent = (content) => {
+    const extractFromTemplateMessage = (msg) => {
+        if (msg.imageMessage) {
+            return { imageMessage: msg.imageMessage };
+        }
+        else if (msg.documentMessage) {
+            return { documentMessage: msg.documentMessage };
+        }
+        else if (msg.videoMessage) {
+            return { videoMessage: msg.videoMessage };
+        }
+        else if (msg.locationMessage) {
+            return { locationMessage: msg.locationMessage };
+        }
+        else {
+            return {
+                conversation: 'contentText' in msg ? msg.contentText : 'hydratedContentText' in msg ? msg.hydratedContentText : ''
+            };
+        }
+    };
+    content = normalizeMessageContent(content);
+    if (content?.buttonsMessage) {
+        return extractFromTemplateMessage(content.buttonsMessage);
+    }
+    if (content?.templateMessage?.hydratedFourRowTemplate) {
+        return extractFromTemplateMessage(content?.templateMessage?.hydratedFourRowTemplate);
+    }
+    if (content?.templateMessage?.hydratedTemplate) {
+        return extractFromTemplateMessage(content?.templateMessage?.hydratedTemplate);
+    }
+    if (content?.templateMessage?.fourRowTemplate) {
+        return extractFromTemplateMessage(content?.templateMessage?.fourRowTemplate);
+    }
+    return content;
+};
+
+export const getDevice = (id) => /^3A.{18}$/.test(id)
+    ? 'ios'
+    : /^3E.{20}$/.test(id)
+        ? 'web'
+        : /^(.{21}|.{32})$/.test(id)
+            ? 'android'
+            : /^(3F|.{18}$)/.test(id)
+                ? 'desktop'
+                : 'unknown';
+
+export const updateMessageWithReceipt = (msg, receipt) => {
+    msg.userReceipt = msg.userReceipt || [];
+    const recp = msg.userReceipt.find(m => m.userJid === receipt.userJid);
+    if (recp) {
+        Object.assign(recp, receipt);
+    }
+    else {
+        msg.userReceipt.push(receipt);
+    }
+};
+
+export const updateMessageWithReaction = (msg, reaction) => {
+    const authorID = getKeyAuthor(reaction.key);
+    const reactions = (msg.reactions || []).filter(r => getKeyAuthor(r.key) !== authorID);
+    reaction.text = reaction.text || '';
+    reactions.push(reaction);
+    msg.reactions = reactions;
+};
+
+export const updateMessageWithPollUpdate = (msg, update) => {
+    const authorID = getKeyAuthor(update.pollUpdateMessageKey);
+    const reactions = (msg.pollUpdates || []).filter(r => getKeyAuthor(r.pollUpdateMessageKey) !== authorID);
+    if (update.vote?.selectedOptions?.length) {
+        reactions.push(update);
+    }
+    msg.pollUpdates = reactions;
+};
+
+export const updateMessageWithEventResponse = (msg, update) => {
+    const authorID = getKeyAuthor(update.eventResponseMessageKey);
+    const responses = (msg.eventResponses || []).filter(r => getKeyAuthor(r.eventResponseMessageKey) !== authorID);
+    responses.push(update);
+    msg.eventResponses = responses;
+};
+
+export function getAggregateVotesInPollMessage({ message, pollUpdates }, meId) {
+    const opts = message?.pollCreationMessage?.options ||
+        message?.pollCreationMessageV2?.options ||
+        message?.pollCreationMessageV3?.options ||
+        [];
+    const voteHashMap = opts.reduce((acc, opt) => {
+        const hash = sha256(Buffer.from(opt.optionName || '')).toString();
+        acc[hash] = {
+            name: opt.optionName || '',
+            voters: []
+        };
+        return acc;
+    }, {});
+    for (const update of pollUpdates || []) {
+        const { vote } = update;
+        if (!vote) {
+            continue;
+        }
+        for (const option of vote.selectedOptions || []) {
+            const hash = option.toString();
+            let data = voteHashMap[hash];
+            if (!data) {
+                voteHashMap[hash] = {
+                    name: 'Unknown',
+                    voters: []
+                };
+                data = voteHashMap[hash];
+            }
+            voteHashMap[hash].voters.push(getKeyAuthor(update.pollUpdateMessageKey, meId));
+        }
+    }
+    return Object.values(voteHashMap);
+}
+
+export function getAggregateResponsesInEventMessage({ eventResponses }, meId) {
+    const responseTypes = ['GOING', 'NOT_GOING', 'MAYBE'];
+    const responseMap = {};
+    for (const type of responseTypes) {
+        responseMap[type] = {
+            response: type,
+            responders: []
+        };
+    }
+    for (const update of eventResponses || []) {
+        const responseType = update.eventResponse || 'UNKNOWN';
+        if (responseType !== 'UNKNOWN' && responseMap[responseType]) {
+            responseMap[responseType].responders.push(getKeyAuthor(update.eventResponseMessageKey, meId));
+        }
+    }
+    return Object.values(responseMap);
+}
+
+export const aggregateMessageKeysNotFromMe = (keys) => {
+    const keyMap = {};
+    for (const { remoteJid, id, participant, fromMe } of keys) {
+        if (!fromMe) {
+            const uqKey = `${remoteJid}:${participant || ''}`;
+            if (!keyMap[uqKey]) {
+                keyMap[uqKey] = {
+                    jid: remoteJid,
+                    participant: participant,
+                    messageIds: []
+                };
+            }
+            keyMap[uqKey].messageIds.push(id);
+        }
+    }
+    return Object.values(keyMap);
+};
+const REUPLOAD_REQUIRED_STATUS = [410, 404];
+
+export const downloadMediaMessage = async (message, type, options, ctx) => {
+    const result = await downloadMsg().catch(async (error) => {
+        if (ctx &&
+            typeof error?.status === 'number' &&
+            REUPLOAD_REQUIRED_STATUS.includes(error.status)) {
+            ctx.logger.info({ key: message.key }, 'sending reupload media request...');
+
+            message = await ctx.reuploadRequest(message);
+            const result = await downloadMsg();
+            return result;
+        }
+        throw error;
+    });
+    return result;
+    async function downloadMsg() {
+        const mContent = extractMessageContent(message.message);
+        if (!mContent) {
+            throw new Boom('No message present', { statusCode: 400, data: message });
+        }
+        const contentType = getContentType(mContent);
+        let mediaType = contentType?.replace('Message', '');
+        const media = mContent[contentType];
+        if (!media || typeof media !== 'object' || (!('url' in media) && !('thumbnailDirectPath' in media))) {
+            throw new Boom(`"${contentType}" message is not a media message`);
+        }
+        let download;
+        if ('thumbnailDirectPath' in media && !('url' in media)) {
+            download = {
+                directPath: media.thumbnailDirectPath,
+                mediaKey: media.mediaKey
+            };
+            mediaType = 'thumbnail-link';
+        }
+        else {
+            download = media;
+        }
+        const stream = await downloadContentFromMessage(download, mediaType, options);
+        if (type === 'buffer') {
+            const bufferArray = [];
+            for await (const chunk of stream) {
+                bufferArray.push(chunk);
+            }
+            return Buffer.concat(bufferArray);
+        }
+        return stream;
+    }
+};
+
+export const assertMediaContent = (content) => {
+    content = extractMessageContent(content);
+    const mediaContent = content?.documentMessage ||
+        content?.imageMessage ||
+        content?.videoMessage ||
+        content?.audioMessage ||
+        content?.stickerMessage;
+    if (!mediaContent) {
+        throw new Boom('given message is not a media message', { statusCode: 400, data: content });
+    }
+    return mediaContent;
+};
+
+const isAnimatedWebP = (buffer) => {
+
+    if (buffer.length < 12 ||
+        buffer[0] !== 0x52 ||
+        buffer[1] !== 0x49 ||
+        buffer[2] !== 0x46 ||
+        buffer[3] !== 0x46 ||
+        buffer[8] !== 0x57 ||
+        buffer[9] !== 0x45 ||
+        buffer[10] !== 0x42 ||
+        buffer[11] !== 0x50) {
+        return false;
+    }
+    ;
+
+    let offset = 12;
+    while (offset < buffer.length - 8) {
+        const chunkFourCC = buffer.toString('ascii', offset, offset + 4);
+        const chunkSize = buffer.readUInt32LE(offset + 4);
+        if (chunkFourCC === 'VP8X') {
+
+            const flagsOffset = offset + 8;
+            if (flagsOffset < buffer.length) {
+                const flags = buffer[flagsOffset];
+                if (flags & 0x02) {
+                    return true;
+                }
+                ;
+            }
+            ;
+        }
+        else if (chunkFourCC === 'ANIM' || chunkFourCC === 'ANMF') {
+
+            return true;
+        }
+        ;
+
+        offset += 8 + chunkSize + (chunkSize % 2);
+    }
+    ;
+    return false;
+};
+
+const isWebPBuffer = (buffer) => {
+    return (buffer.length >= 12 &&
+        buffer[0] === 0x52 &&
+        buffer[1] === 0x49 &&
+        buffer[2] === 0x46 &&
+        buffer[3] === 0x46 &&
+        buffer[8] === 0x57 &&
+        buffer[9] === 0x45 &&
+        buffer[10] === 0x42 &&
+        buffer[11] === 0x50);
+};
+
+export const shouldIncludeBizBinaryNode = (message) => !!(message.buttonsMessage ||
+    message.listMessage ||
+    message.templateMessage ||
+    (message.interactiveMessage &&
+        (message.interactiveMessage.nativeFlowMessage ||
+            message.interactiveMessage.carouselMessage?.cards?.some(card => card?.nativeFlowMessage))));
