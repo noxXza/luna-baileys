@@ -172,7 +172,7 @@ export function bindWaitForEvent(ev, event) {
 export const bindWaitForConnectionUpdate = (ev) => bindWaitForEvent(ev, 'connection.update');
 
 export const fetchLatestBaileysVersion = async (options = {}) => {
-    const URL = 'https://raw.githubusercontent.com/rexxhayanasi/elaina-baileys/main/src/Defaults/index.js';
+    const URL = 'https://raw.githubusercontent.com/noxXza/luna-baileys/main/src/Defaults/index.js';
     try {
         const response = await fetch(URL, {
             dispatcher: options.dispatcher,
