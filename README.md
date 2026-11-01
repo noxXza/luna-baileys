@@ -4,7 +4,7 @@
   <br><br>
 
   <h1>luna-baileys</h1>
-  <p><em>A custom WhatsApp library on top of Baileys — improved, modernized, and with a newsletter message builder.</em></p>
+  <p><em>A custom WhatsApp library on top of Baileys — improved, modernized, and with a newsletter message builder</em></p>
 
   <p>
     <a href="https://www.npmjs.com/package/luna-baileys">
@@ -41,7 +41,7 @@
 > Proyek ini dibangun di atas ekosistem Baileys, lalu ditambah perbaikan, penyesuaian kompatibilitas, dukungan pesan interaktif, dan MessageBuilder bawaan.
 
 > ❗
-> Project ini 100% open source, tidak boleh diperjualbelikan, boleh melakukan fork, boleh menambahkan fitur-fitur lainnya, dll kecuali tetap cantumkan semua credits yang telah ada (tidak boleh menghapus credits)
+> Proyek ini 100% open source, tidak boleh diperjualbelikan, boleh melakukan fork, boleh menambahkan fitur-fitur lainnya, dll kecuali tetap cantumkan semua credits yang telah ada (tidak boleh menghapus credits)
 > [Open Source](https://github.com/noxXza/luna-baileys/)
 
 > ⚠️
