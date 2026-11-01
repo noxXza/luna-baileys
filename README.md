@@ -1,11 +1,10 @@
-
-
 <div align="center">
-  <h1>luna-baileys</h1>
-  <p><em>A custom WhatsApp library on top of Baileys — improved, modernized, and with a built-in message builder.</em></p>
 
-  <img src= "https://raw.githubusercontent.com/noxXza/data/refs/heads/main/luna-baileys.png" width="400" alt="Luna Baileys Banner" />
+  <img src="https://raw.githubusercontent.com/noxXza/data/refs/heads/main/luna-baileys.png" width="400" alt="Luna Baileys Banner" />
   <br><br>
+
+  <h1>luna-baileys</h1>
+  <p><em>A custom WhatsApp library on top of Baileys — improved, modernized, and with a newsletter message builder.</em></p>
 
   <p>
     <a href="https://www.npmjs.com/package/luna-baileys">
@@ -29,22 +28,23 @@
   </p>
 </div>
 
-<div align="center">
-  <img src="https://user-images.githubusercontent.com/74038190/212257468-1e9a91f1-b636-4676-a213-39d67b2d5d67.gif" width="100%">
-</div>
 
-> [!IMPORTANT]
+> 💬
 > `luna-baileys` adalah library API WhatsApp Web tidak resmi. Tidak berafiliasi, tidak diizinkan, tidak dipelihara, tidak disponsori, dan tidak didukung oleh WhatsApp maupun Meta.
 >
 > Pakai proyek ini dengan bertanggung jawab, dan patuhi Ketentuan Layanan WhatsApp serta hukum yang berlaku.
 
-> [!NOTE]
-> Fitur yang direkonstruksi dari bundle WhatsApp Web, beserta sejauh mana masing-masing sudah diverifikasi, didokumentasikan di [EXPERIMENTAL.md](EXPERIMENTAL.md).
+> 📍
+> Fitur yang direkonstruksi dari bundle WhatsApp Web, beserta sejauh mana masing-masing sudah diverifikasi, didokumentasikan di [EXPERIMENTAL.md](EXPERIMENTAL.md)
 
-> [!NOTE]
+> 📍
 > Proyek ini dibangun di atas ekosistem Baileys, lalu ditambah perbaikan, penyesuaian kompatibilitas, dukungan pesan interaktif, dan MessageBuilder bawaan.
 
-> [!CAUTION]
+> ❗
+> Project ini 100% open source, tidak boleh diperjualbelikan, boleh melakukan fork, boleh menambahkan fitur-fitur lainnya, dll kecuali tetap cantumkan semua credits yang telah ada (tidak boleh menghapus credits)
+> [Open Source](https://github.com/noxXza/luna-baileys/)
+
+> ⚠️
 > Channel update proyek yang lama sudah tidak dipakai. Informasi rilis, catatan perubahan, dan pengumuman proyek diterbitkan lewat WhatsApp Channel yang ditautkan di README ini.
 
 ---
@@ -920,7 +920,7 @@ Versi protokol WhatsApp yang baru bisa mengidentifikasi pengguna dengan alamat L
 Bentuk yang umum antara lain:
 
 ```text
-6281234567890@s.whatsapp.net
+6283874851613@s.whatsapp.net
 123456789012345@lid
 120363xxxxxxxxxx@g.us
 123456789@newsletter
@@ -984,8 +984,8 @@ await sock.sendMessage(jid, {
 
 ```js
 await sock.sendMessage(jid, {
-  text: 'Halo @628123456789',
-  mentions: ['628123456789@s.whatsapp.net']
+  text: 'Halo @6283874851613',
+  mentions: ['6283874851613@s.whatsapp.net']
 })
 ```
 
@@ -1111,7 +1111,7 @@ Setiap sakelar yang ditampilkan WhatsApp di composer polling-nya sendiri tersedi
 `canAddOption` tetap jadi pengecualian: ia menggagalkan seluruh polling di mana pun flag penerimanya mati, ada gambar atau tidak.
 
 ```js
- await conn.sendMessage(jid, {
+ await sock.sendMessage(jid, {
   poll: {
     name: 'Yang mana yang enak?',
     values: [
@@ -4046,8 +4046,8 @@ Menyetel nama atau foto admin milikmu sendiri **tidak mungkin dari API klien man
 #### Undangan Admin
 
 ```js
-await sock.newsletterCreateAdminInvite('123456789@newsletter', '6281234567890@s.whatsapp.net')
-await sock.newsletterRevokeAdminInvite('123456789@newsletter', '6281234567890@s.whatsapp.net')
+await sock.newsletterCreateAdminInvite('123456789@newsletter', '6283874851613@s.whatsapp.net')
+await sock.newsletterRevokeAdminInvite('123456789@newsletter', '6283874851613@s.whatsapp.net')
 await sock.newsletterAcceptAdminInvite('123456789@newsletter')
 ```
 
@@ -4182,8 +4182,8 @@ displayUsername('rexx')            // '@rexx'
 ```js
 await sock.updateTextStatus('Sedang bikin bot', { emoji: '🤖', ephemeralDurationSec: 0 })
 
-const mine = await sock.fetchTextStatus(['6281234567890@s.whatsapp.net'])
-const about = await sock.fetchAbout('6281234567890@s.whatsapp.net')
+const mine = await sock.fetchTextStatus(['6283874851613@s.whatsapp.net'])
+const about = await sock.fetchAbout('6283874851613@s.whatsapp.net')
 console.log(about.status)
 ```
 
@@ -4210,7 +4210,7 @@ await sock.updateUserNoticeStage('20601216', 5)
 const list = await sock.fetchOptOutList({ category: 'marketing' })
 
 await sock.updateOptOut({
-  jid: '6281234567890@s.whatsapp.net',
+  jid: '6283874851613@s.whatsapp.net',
   category: 'marketing',
   action: 'add',
   reason: 'user_request'
@@ -4242,8 +4242,8 @@ const preview = await sock.fetchServerLinkPreview('https://example.com')
 const group = await sock.groupCreate(
   'Luna Community',
   [
-    '6281234567890@s.whatsapp.net',
-    '6289876543210@s.whatsapp.net'
+    '6283874851613@s.whatsapp.net',
+    '6283874851613@s.whatsapp.net'
   ]
 )
 
@@ -4255,7 +4255,7 @@ console.log(group.id)
 ```js
 await sock.groupParticipantsUpdate(
   groupJid,
-  ['6281234567890@s.whatsapp.net'],
+  ['6283874851613@s.whatsapp.net'],
   'add'
 )
 ```
@@ -4265,7 +4265,7 @@ await sock.groupParticipantsUpdate(
 ```js
 await sock.groupParticipantsUpdate(
   groupJid,
-  ['6281234567890@s.whatsapp.net'],
+  ['6283874851613@s.whatsapp.net'],
   'remove'
 )
 ```
@@ -4601,7 +4601,7 @@ await sock.sendReceipts([msg.key], 'read')
 ### Memeriksa Nomor
 
 ```js
-const results = await sock.onWhatsApp('6281234567890', '6289876543210')
+const results = await sock.onWhatsApp('6283874851613', '6283874851613')
 for (const entry of results) {
   console.log(entry.jid, entry.exists)
 }
@@ -4789,7 +4789,7 @@ sock.ev.on('connection.update', async ({ connection }) => {
     }
 
     const voip = await makeVoipClient(sock)
-    const call = await voip.call('628123456789', {
+    const call = await voip.call('6283874851613', {
         durationMs: 60000,
         audioSource: './halo.mp3'
     })
@@ -4823,7 +4823,7 @@ sock.ev.on('connection.update', async ({ connection }) => {
 Setiap panggilan menerima playlist, dan antreannya yang menggerakkan panggilan, bukan sebaliknya: putar satu lagu, tutup saat selesai; atau putar, tunggu sementara lagu berikutnya dicari, putar yang itu, lalu tutup.
 
 ```js
-const call = await voip.call('628123456789', {
+const call = await voip.call('6283874851613', {
     playlist: ['satu.mp3'],
     durationMs: 0
 })
@@ -4834,7 +4834,7 @@ Satu lagu, lalu panggilannya berakhir sendiri — `endWhenQueueEmpty` aktif seca
 Untuk antrean yang lagu berikutnya masih harus dicari, beri jedanya jendela toleransi dan isi sementara panggilannya tetap tersambung:
 
 ```js
-const call = await voip.call('628123456789', {
+const call = await voip.call('6283874851613', {
     playlist: [await findTrack('lagu pertama')],
     idleGraceMs: 30000,
     durationMs: 0
@@ -4862,7 +4862,7 @@ await call.waitForEnd()
 Panggilan satu lawan satu maupun grup dua-duanya menerima video. Frame-nya datang dari ffmpeg sama seperti audionya, jadi sumber videonya bisa berupa berkas, URL, gambar diam, atau generator `lavfi:`.
 
 ```js
-const call = await voip.call('628123456789', {
+const call = await voip.call('6283874851613', {
     video: true,
     videoPlaylist: ['klip.mp4'],
     playlist: ['lagu.mp3'],
@@ -4884,7 +4884,7 @@ Video punya antreannya sendiri, terpisah dari antrean audio: `playVideo`, `enque
 Gambar diam diulang terus ketimbang ditampilkan satu frame saja, dan itu cara mudah mengirim kartu yang tetap:
 
 ```js
-await voip.call('628123456789', { video: true, videoSource: './poster.jpg', playlist: ['lagu.mp3'] })
+await voip.call('6283874851613', { video: true, videoSource: './poster.jpg', playlist: ['lagu.mp3'] })
 ```
 
 Mesinnya memilih resolusi dan laju frame saat panggilannya tersambung, dan pengumpannya menskalakan agar pas, menambahkan padding supaya rasio aspeknya tetap. Frame-nya dikirim sebagai I420 langsung ke encoder WASM — tidak ada WebCodecs di Node, jadi jalur encode browser-nya tidak dipakai. Saat antreannya kering, frame terakhirnya dipertahankan ketimbang memotong ke hitam, jadi tersendatnya terbaca sebagai gambar membeku, bukan kedipan.
@@ -4896,7 +4896,7 @@ Audio dan video itu dua proses ffmpeg dengan dua jam berbeda. Memutar berkas yan
 Video yang sama, dikirim sebagai berbagi layar ketimbang sebagai kamera. Ini titik masuk wasm yang terpisah, jadi penerimanya melihatnya berlabel layar yang dibagikan, bukan seperti bot menyalakan kameranya.
 
 ```js
-const call = await voip.call('628123456789', {
+const call = await voip.call('6283874851613', {
     screenShare: true,
     videoPlaylist: ['slide.png'],
     playlist: ['narasi.mp3']

@@ -1,7 +1,7 @@
 {
   "name": "luna-baileys",
-  "version": "3.0.0",
-  "description": "Modded Baileys with interactive message, album, messageBuilder, newsletter, and VoIP support",
+  "version": "9.0.28",
+  "description": "Modded Baileys V7 with interactive message, album, messageBuilder, newsletter, and VoIP support",
   "main": "src/index.js",
   "types": "src/index.d.ts",
   "type": "module",
@@ -28,11 +28,16 @@
   "files": [
     "src/**/*",
     "WAProto/**/*",
-    "engine-requirements.js"
+    "engine-requirements.js",
+    "EXPERIMENTAL.md",    
+    "LICENSE",
+    "package.json",
+    "README.md"
   ],
   "keywords": [
     "automation",
-    "baileys",
+    "luna-baileys",
+    "noxXza",
     "bot",
     "bot-whatsapp",
     "js-whatsapp",

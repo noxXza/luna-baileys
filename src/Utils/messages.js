@@ -730,6 +730,31 @@ export const hasValidCarouselHeader = (message) => {
         message.videoMessage ||
         message.productMessage);
 };
+
+// Accept the same raw buttonsMessage payload used by Noxleyss. Location
+// thumbnails are normalized to JPEG before being placed in the protobuf.
+const processLocationThumbnail = async (input, options = {}) => {
+    let buffer;
+    if (Buffer.isBuffer(input)) {
+        buffer = input;
+    }
+    else if (typeof input === 'string' && /^https?:\/\//i.test(input)) {
+        const response = await fetch(input, { dispatcher: options?.dispatcher });
+        if (!response.ok) {
+            throw new Boom(`could not fetch location thumbnail: ${response.status}`, { statusCode: 400 });
+        }
+        buffer = Buffer.from(await response.arrayBuffer());
+    }
+    else if (typeof input === 'string') {
+        buffer = await fs.readFile(input);
+    }
+    else {
+        throw new Boom('location thumbnail must be a URL, file path, or Buffer', { statusCode: 400 });
+    }
+    const { buffer: jpeg } = await extractImageThumb(buffer, 300);
+    return jpeg;
+};
+
 export const generateWAMessageContent = async (message, options) => {
     var _a, _b;
     let m = {};
@@ -1213,6 +1238,52 @@ export const generateWAMessageContent = async (message, options) => {
                 showAdAttribution: false,
                 sourceUrl: url,
                 mediaUrl: url
+            })
+        };
+    }
+    else if (hasNonNullishProperty(message, 'buttonsMessage')) {
+        const bm = message.buttonsMessage;
+        let locationMessage;
+
+        if (bm.locationMessage) {
+            const loc = bm.locationMessage;
+            const thumbnailInput = loc.jpegThumbnail || loc.thumbnail;
+            const jpegThumbnail = thumbnailInput
+                ? await processLocationThumbnail(thumbnailInput, options?.options)
+                : undefined;
+
+            locationMessage = proto.Message.LocationMessage.create({
+                degreesLatitude: loc.degreesLatitude ?? 0,
+                degreesLongitude: loc.degreesLongitude ?? 0,
+                name: loc.name || '',
+                address: loc.address || '',
+                jpegThumbnail
+            });
+        }
+
+        const buttons = (bm.buttons || []).map(button => proto.Message.ButtonsMessage.Button.create({
+            buttonId: button.buttonId || '',
+            buttonText: proto.Message.ButtonsMessage.Button.ButtonText.create({
+                displayText: button.buttonText?.displayText || ''
+            }),
+            type: button.type ?? 1,
+            nativeFlowInfo: button.nativeFlowInfo
+                ? proto.Message.ButtonsMessage.Button.NativeFlowInfo.create({
+                    name: button.nativeFlowInfo.name || '',
+                    paramsJson: button.nativeFlowInfo.paramsJson || '',
+                    buttonParamsJson: button.nativeFlowInfo.buttonParamsJson || button.nativeFlowInfo.paramsJson || ''
+                })
+                : undefined
+        }));
+
+        m = {
+            buttonsMessage: proto.Message.ButtonsMessage.create({
+                locationMessage,
+                contentText: bm.contentText || '',
+                footerText: bm.footerText || '',
+                buttons,
+                headerType: bm.headerType ?? 6,
+                viewOnce: !!bm.viewOnce
             })
         };
     }
