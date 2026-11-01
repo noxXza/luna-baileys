@@ -1,6 +1,6 @@
 {
   "name": "luna-baileys",
-  "version": "9.0.29",
+  "version": "9.0.30",
   "description": "Modded Baileys V7 with interactive message, album, messageBuilder, newsletter, and VoIP support",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -29,7 +29,7 @@
     "src/**/*",
     "WAProto/**/*",
     "engine-requirements.js",
-    "EXPERIMENTAL.md",    
+    "EXPERIMENTAL.md",
     "LICENSE",
     "package.json",
     "README.md"
