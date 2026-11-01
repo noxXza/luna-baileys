@@ -4,7 +4,7 @@
   <h1>luna-baileys</h1>
   <p><em>A custom WhatsApp library on top of Baileys — improved, modernized, and with a built-in message builder.</em></p>
 
-  <img src="https://files.catbox.moe/anp49c.png" width="400" alt="Luna Baileys Banner" />
+  <img src= "https://raw.githubusercontent.com/noxXza/data/refs/heads/main/luna-baileys.png" width="400" alt="Luna Baileys Banner" />
   <br><br>
 
   <p>
